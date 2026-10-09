@@ -3479,8 +3479,8 @@ tags = ["audio", "bar", "utility"]
 [[plugin]]
 id = "pk/geoip-monitor"
 name = "GeoIP Monitor"
-version = "1.2.3"
-updated_at = 1791552668
+version = "1.2.4"
+updated_at = 1791573181
 added_at = 1791552668
 author = "pk"
 license = "MIT"
