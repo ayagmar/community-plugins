@@ -70,6 +70,7 @@ body:
         - config-swap
         - contact-sounds
         - crashes
+        - currency-exchange
         - cursor
         - custom-shortcut
         - daily-wallpaper
