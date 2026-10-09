@@ -335,8 +335,8 @@ tags = ["launcher", "development", "productivity"]
 [[plugin]]
 id = "pozzoo/hassio"
 name = "Home Assistant"
-version = "2.0.8"
-updated_at = 1788198834
+version = "2.0.9"
+updated_at = 1791573122
 added_at = 1784351187
 author = "Pozzoo"
 license = "MIT"
