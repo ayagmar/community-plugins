@@ -3140,8 +3140,8 @@ tags = ["hardware", "bar", "panel", "service", "indicator", "hyprland"]
 [[plugin]]
 id = "omertahaoztop/vikunja"
 name = "Vikunja"
-version = "1.0.2"
-updated_at = 1790519364
+version = "1.0.4"
+updated_at = 1791573317
 added_at = 1790468776
 author = "omertahaoztop"
 license = "MIT"
