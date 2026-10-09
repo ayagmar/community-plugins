@@ -3488,3 +3488,16 @@ icon = "globe"
 description = "Reports geographical location based on external ip in the bar"
 plugin_api = 9
 tags = ["bar", "network", "utility"]
+
+[[plugin]]
+id = "vinioli/currency-exchange"
+name = "Currency Exchange"
+version = "1.0.0"
+updated_at = 1791582937
+added_at = 1791582937
+author = "vinioli"
+license = "MIT"
+icon = "currency-dollar"
+description = "Live exchange rates on the bar, plus a converter panel and a /fx launcher provider."
+plugin_api = 10
+tags = ["bar", "launcher", "panel", "utility"]
