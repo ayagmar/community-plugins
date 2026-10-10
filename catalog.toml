@@ -3501,3 +3501,16 @@ icon = "currency-dollar"
 description = "Live exchange rates on the bar, plus a converter panel and a /fx launcher provider."
 plugin_api = 10
 tags = ["bar", "launcher", "panel", "utility"]
+
+[[plugin]]
+id = "miguelfm/ai-triage"
+name = "AI Triage"
+version = "1.0.0"
+updated_at = 1791591274
+added_at = 1791591274
+author = "miguelfm"
+license = "MIT"
+icon = "brain"
+description = "AI quota triage, smart model routing and rolling window kickstarting."
+plugin_api = 22
+tags = ["bar", "panel", "ai", "indicator", "utility"]
