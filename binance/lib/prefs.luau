@@ -11,6 +11,7 @@ M.ALERT_KINDS = { above = true, below = true, move_pct = true }
 M.DEFAULT_COOLDOWN_MIN = 60
 local MAX_WATCHLIST = 50
 local MAX_ALERTS = 100
+local MAX_ASSET_TARGETS = 50
 
 export type Alert = {
   id: string,
@@ -28,10 +29,12 @@ export type Prefs = {
   watchlist: { string },
   alerts: { Alert },
   summary_day: string?, -- local day the daily summary was last sent
+  drift_flagged: { string }, -- classes and holdings already notified as off target
+  asset_targets: { [string]: number }, -- holding key (BTC, EQ_NVDA) -> share of the portfolio
 }
 
 function M.defaults(): Prefs
-  return { privacy = false, bar_mode = "full", watchlist = { "BTCUSDT", "ETHUSDT" }, alerts = {} }
+  return { privacy = false, bar_mode = "full", watchlist = { "BTCUSDT", "ETHUSDT" }, alerts = {}, drift_flagged = {}, asset_targets = {} }
 end
 
 -- Stock tickers are stored as EQ_<TICKER>, the wallet's code for Binance
@@ -77,6 +80,18 @@ function M.sanitize(raw): Prefs
   if type(raw.summary_day) == "string" and string.match(raw.summary_day, "^%d%d%d%d%-%d%d%-%d%d$") then
     p.summary_day = raw.summary_day
   end
+  if type(raw.drift_flagged) == "table" then
+    for _, id in raw.drift_flagged do
+      if type(id) == "string" and not table.find(p.drift_flagged, id) then
+        table.insert(p.drift_flagged, id)
+      end
+    end
+  end
+  if type(raw.asset_targets) == "table" then
+    for key, share in raw.asset_targets do
+      M.setAssetTarget(p, key, share)
+    end
+  end
   if type(raw.watchlist) == "table" then
     p.watchlist = {}
     for _, symbol in raw.watchlist do
@@ -101,6 +116,32 @@ function M.sanitize(raw): Prefs
     end
   end
   return p
+end
+
+-- Sets a holding's target share (0 < share <= 1), or removes it with nil.
+function M.setAssetTarget(p: Prefs, key: any, share: any): boolean
+  if not M.validSymbol(key) then
+    return false
+  end
+  if share == nil then
+    local had = p.asset_targets[key] ~= nil
+    p.asset_targets[key] = nil
+    return had
+  end
+  if type(share) ~= "number" or not (share > 0 and share <= 1) or p.asset_targets[key] == share then
+    return false
+  end
+  if p.asset_targets[key] == nil then
+    local n = 0
+    for _ in p.asset_targets do
+      n += 1
+    end
+    if n >= MAX_ASSET_TARGETS then
+      return false
+    end
+  end
+  p.asset_targets[key] = share
+  return true
 end
 
 function M.watchAdd(p: Prefs, symbol: string): boolean

@@ -33,7 +33,7 @@ local ACTIONABLE = {
   keyring_readback_failed = true,
 }
 
-local SOURCE_ORDER = { "prices", "balances", "stocks", "quotes", "flows" }
+local SOURCE_ORDER = { "prices", "balances", "stocks", "quotes", "flows", "trades" }
 
 local function tr(key: string, subst)
   return noctalia.tr(key, subst)

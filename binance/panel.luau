@@ -37,6 +37,11 @@ local render
 
 local ctx = { tab = "overview", canOpenUrls = canOpenUrls }
 
+function ctx.openSettings()
+  panel.close()
+  noctalia.openSettings()
+end
+
 -- Forms, filters and folds start over on every open; the tab is kept.
 local function resetCtx()
   ctx.holdingsFilter = "all"
@@ -52,6 +57,9 @@ local function resetCtx()
   ctx.confirmDisconnect = nil
   ctx.copied = nil -- { key, untilAt }
   ctx.exportAskedAt = nil
+  ctx.depositDraft = ""
+  ctx.targetForm = nil
+  ctx.depositSeed = (ctx.depositSeed or 0) + 1
 end
 
 resetCtx()
@@ -184,8 +192,7 @@ local function header()
       controlSize = "sm",
       tooltip = tr("panel.settings"),
       onClick = function()
-        panel.close()
-        noctalia.openSettings()
+        ctx.openSettings()
       end,
     })
   ))

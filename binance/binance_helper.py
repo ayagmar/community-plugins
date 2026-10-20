@@ -51,6 +51,7 @@ CACHE_FILES = (
     "stock-orders.json.partial", "stocks.json", "ledger.json", "marks.json",
     "cursors.json", "flows.json", "flows-daily.json", "clock.json", "probe.json", "probe-redacted.json",
     "stock-quotes.json", "equity-symbols.json", "export.csv", "export-request.json",
+    "trades.json", "crypto-costs.json",
 )
 RATELIMIT_FILES = ("ratelimit-public.json", "ratelimit-signed.json")
 RATE_HEADERS = (
@@ -569,7 +570,7 @@ def cmd_disconnect(args):
 ACCOUNT_COMMANDS = {"keygen", "store-api-key", "verify", "recheck"}
 # Subcommands that read account data with the active key; refused while the
 # active key fails the read-only gate (account.json "gate_failed").
-DATA_COMMANDS = {"balances", "stocks-sync", "flows-sync", "deposits-recent", "stock-quotes"}
+DATA_COMMANDS = {"balances", "stocks-sync", "flows-sync", "deposits-recent", "stock-quotes", "trades-sync"}
 # Error detail worth showing in the wizard; nothing else is copied.
 ACCOUNT_ERROR_KEYS = ("flags", "slot", "status", "binance_code", "msg", "until_ms", "has_private", "package", "detail")
 
@@ -1552,6 +1553,232 @@ def cmd_deposits_recent(args):
     return cmd_flows_sync(args, ("deposit",))
 
 
+# ── Crypto cost basis ──────────────────────────────────────────────────────
+
+# Spot pairs are read for each held coin against these quotes. Binance keeps
+# no per-coin purchase price, so the cost comes from replaying these fills
+# together with deposits and withdrawals valued at flow time (flows.json).
+TRADE_QUOTES = ("USDT", "USDC", "FDUSD", "BTC", "ETH", "BNB", "EUR")
+# Cash, with no basis to track: the stablecoins and fiat of lib/allocation.luau.
+NO_COST_ASSETS = {
+    "USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "PYUSD", "USDE", "USD1", "RLUSD", "BFUSD", "BUSD",
+    "EURI", "AEUR", "EURC",
+    "USD", "EUR", "GBP", "TRY", "BRL", "ARS", "MXN", "PLN", "RON", "CZK", "UAH", "ZAR", "JPY", "AUD",
+    "COP", "KZT", "NGN", "IDR", "CHF", "SEK", "NOK",
+}
+TRADE_PAGE = 1000
+TRADE_MAX_CALLS = 30  # myTrades calls per invocation, weight 20 each
+TRADE_INVALID_TTL_MS = 30 * DAY_MS  # how long a pair that doesn't exist stays skipped
+TRADE_REFRESH_MS = 50 * 60_000  # a pair read this recently is up to date
+TRADE_IP_WEIGHT_CAP = 4000  # of Binance's 6000 per minute per IP: stop the chunk above it
+COST_MISMATCH = Decimal("0.01")  # replay vs wallet share above which the basis is approximate
+
+
+def trade_fill(row):
+    if not isinstance(row, dict) or row.get("id") is None or dec(row.get("qty")) <= 0:
+        return None
+    return {"id": int(row["id"]), "at_ms": int(row.get("time") or 0), "qty": num(dec(row.get("qty"))),
+            "quote_qty": num(dec(row.get("quoteQty"))), "buyer": bool(row.get("isBuyer")),
+            "fee": num(dec(row.get("commission"))), "fee_asset": row.get("commissionAsset") or ""}
+
+
+def held_coins(balances):
+    coins = set()
+    for wallet in (balances or {}).get("wallets") or []:
+        for a in wallet.get("assets") or []:
+            if dec(a.get("total")) > 0 and a.get("asset") and a["asset"] not in NO_COST_ASSETS:
+                coins.add(a["asset"])
+    return coins
+
+
+def wallet_quantities(balances):
+    qty = {}
+    for wallet in (balances or {}).get("wallets") or []:
+        for a in wallet.get("assets") or []:
+            if a.get("asset"):
+                qty[a["asset"]] = qty.get(a["asset"], Decimal(0)) + dec(a.get("total"))
+    return qty
+
+
+def price_fills(pricer, pairs):
+    """Adds `px` (USD per quote unit) and, for a fee paid in a third asset,
+    `fee_usd`, at trade time. Raises OutOfLookups when lookups run out."""
+    for pair in pairs.values():
+        for fill in pair["fills"]:
+            if "px" not in fill and not fill.get("unpriced"):
+                price = pricer.usd_price(pair["quote"], fill["at_ms"])
+                if price is None:
+                    fill["unpriced"] = True
+                else:
+                    fill["px"] = num(price, 8)
+            fee_asset = fill["fee_asset"]
+            if (dec(fill["fee"]) > 0 and fee_asset not in (pair["base"], pair["quote"])
+                    and "fee_usd" not in fill and not fill.get("fee_unpriced")):
+                price = pricer.usd_price(fee_asset, fill["at_ms"])
+                if price is None:
+                    fill["fee_unpriced"] = True
+                else:
+                    fill["fee_usd"] = num(dec(fill["fee"]) * price, 8)
+
+
+def replay_crypto(pairs, flows, wallet, coins):
+    """Average cost per coin in USD. A buy adds what was paid (fees
+    included); a sell or a trade paying with the coin removes cost at the
+    running average and realizes the difference; a deposit adds its value at
+    flow time and a withdrawal removes cost without a result. The wallet is
+    authoritative for the quantity: a coin whose replayed quantity differs
+    from it by more than 1% (Earn rewards, Convert, airdrops) is flagged
+    `cost_approx`, and a coin with no replayed quantity has no basis."""
+    events = []  # (at, order, coin, qty, usd or None, realizes)
+
+    def add(at, coin, qty, usd, realizes=True):
+        if coin in coins and qty != 0:
+            events.append((at, 0 if qty > 0 else 1, coin, qty, usd, realizes))
+
+    for pair in pairs.values():
+        base, quote = pair["base"], pair["quote"]
+        for f in pair["fills"]:
+            qty, quote_qty, fee = dec(f["qty"]), dec(f["quote_qty"]), dec(f["fee"])
+            px = dec(f["px"]) if "px" in f else None
+            value = quote_qty * px if px is not None else None
+            fee_value = dec(f["fee_usd"]) if "fee_usd" in f else Decimal(0)
+            if f["fee_asset"] == quote and px is not None:
+                fee_value = fee * px
+            base_fee = fee if f["fee_asset"] == base else Decimal(0)
+            quote_fee = fee if f["fee_asset"] == quote else Decimal(0)
+            quote_fee_value = fee_value if quote_fee else Decimal(0)
+            if f["buyer"]:
+                add(f["at_ms"], base, qty - base_fee, None if value is None else value + fee_value)
+                add(f["at_ms"], quote, -(quote_qty + quote_fee), None if value is None else value + quote_fee_value)
+            else:
+                add(f["at_ms"], base, -(qty + base_fee), None if value is None else value - fee_value)
+                add(f["at_ms"], quote, quote_qty - quote_fee, None if value is None else value - quote_fee_value)
+            if fee > 0 and f["fee_asset"] not in (base, quote):
+                # A fee paid in a third coin (BNB) leaves that coin's book too.
+                add(f["at_ms"], f["fee_asset"], -fee, dec(f["fee_usd"]) if "fee_usd" in f else None)
+    for flow in flows:
+        if flow.get("asset") in coins:
+            amount = dec(flow.get("amount"))
+            usd = dec(flow["usd"]) if "usd" in flow else None
+            add(int(flow.get("at_ms") or 0), flow["asset"], amount if flow.get("dir") == "in" else -amount,
+                usd, realizes=False)
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    book = {c: {"qty": Decimal(0), "cost": Decimal(0), "realized": Decimal(0), "approx": False} for c in coins}
+    for _, _, coin, qty, usd, realizes in events:
+        p = book[coin]
+        if qty > 0:
+            if usd is None:
+                p["approx"] = True  # held, at a cost nobody recorded
+                continue
+            p["qty"] += qty
+            p["cost"] += usd
+            continue
+        out = -qty
+        take = min(out, p["qty"])
+        if take < out - DUST:
+            p["approx"] = True  # more left than the history brought in
+        if take <= 0:
+            continue
+        average = p["cost"] / p["qty"]
+        if realizes and usd is not None:
+            p["realized"] += usd * take / out - average * take
+        p["cost"] -= average * take
+        p["qty"] -= take
+
+    costs = {}
+    for coin, p in sorted(book.items()):
+        held = wallet.get(coin, Decimal(0))
+        if p["qty"] <= DUST or held <= DUST:
+            continue
+        average = max(p["cost"], Decimal(0)) / p["qty"]
+        approx = p["approx"] or abs(held - p["qty"]) > held * COST_MISMATCH
+        costs[coin] = {"avg_cost": num(average, 8), "cost": num(average * held, 8),
+                       "realized_pnl": num(p["realized"], 8), "cost_approx": approx}
+    return costs
+
+
+def cmd_trades_sync(args):
+    """Reads new spot fills for each held coin's pairs, a chunk at a time
+    (done: false asks for the next), then writes crypto-costs.json."""
+    data_dir = args.data_dir
+    client = Binance(data_dir, *load_active_pair(DATA_KEYRING_TIMEOUT_S))
+    balances = read_object(os.path.join(data_dir, "balances.json"))
+    flows_file = read_object(os.path.join(data_dir, "flows.json")) or {}
+    path = os.path.join(data_dir, "trades.json")
+    stored = read_object(path) or {}
+    pairs = stored.get("pairs") if isinstance(stored.get("pairs"), dict) else {}
+    invalid = stored.get("invalid") if isinstance(stored.get("invalid"), dict) else {}
+    at = now_ms()
+    coins = held_coins(balances)
+    budget = FlowBudget(client, {}, args.started)
+    calls = 0
+
+    def save():
+        write_json_atomic(path, {"v": 1, "pairs": pairs, "invalid": invalid})
+
+    # Each held coin against every quote, plus pairs with fills whose base is
+    # gone: spending BTC on a coin since sold still moved BTC.
+    symbols = {coin + quote: (coin, quote) for coin in coins for quote in TRADE_QUOTES if coin != quote}
+    for symbol, pair in pairs.items():
+        if pair.get("fills"):
+            symbols.setdefault(symbol, (pair["base"], pair["quote"]))
+    pending, wait_ms = False, 0
+    try:
+        for symbol, (coin, quote) in sorted(symbols.items()):
+            if at - int(invalid.get(symbol) or 0) < TRADE_INVALID_TTL_MS:
+                continue
+            pair = pairs.setdefault(symbol, {"base": coin, "quote": quote, "next_id": 0, "fills": []})
+            while at - int(pair.get("read_at") or 0) >= TRADE_REFRESH_MS:
+                if int(client.weights.get("x-mbx-used-weight-1m") or 0) > TRADE_IP_WEIGHT_CAP:
+                    pending, wait_ms = True, 60_000 - now_ms() % 60_000
+                    break
+                if calls >= TRADE_MAX_CALLS or budget.out_of_time():
+                    pending = True
+                    break
+                calls += 1
+                try:
+                    rows = client.get("/api/v3/myTrades",
+                                      {"symbol": symbol, "fromId": pair["next_id"], "limit": TRADE_PAGE})
+                except HelperError as error:
+                    if error.detail.get("binance_code") != -1121:  # invalid symbol
+                        raise
+                    invalid[symbol] = at
+                    if not pair["fills"]:
+                        pairs.pop(symbol)  # a delisted pair keeps the fills it had
+                    break
+                fills = [f for f in map(trade_fill, rows if isinstance(rows, list) else []) if f]
+                pair["fills"].extend(fills)
+                if fills:
+                    pair["next_id"] = max(f["id"] for f in fills) + 1
+                if len(rows or []) < TRADE_PAGE:
+                    pair["read_at"] = at
+            if pending:
+                break
+        priced = True
+        try:
+            price_fills(FlowPricer(budget), pairs)
+        except OutOfLookups:
+            priced = False
+    finally:
+        save()
+    if pending or not priced:
+        return {"ok": True, "done": False, "wait_ms": wait_ms}
+    costs = replay_crypto(pairs, flows_file.get("flows") or [], wallet_quantities(balances), coins)
+    # Synced once every source is read back to its floor; one Binance refuses
+    # (not offered in the region) won't ever be, so it doesn't count.
+    coverage = flows_file.get("coverage") or {}
+    synced = bool(flows_file.get("complete")) or (bool(coverage) and all(
+        c.get("complete") or "error" in c for c in coverage.values()))
+    if not synced:
+        for cost in costs.values():
+            cost["cost_approx"] = True  # deposits or withdrawals may be missing
+    write_json_atomic(os.path.join(data_dir, "crypto-costs.json"), {
+        "v": 1, "at_ms": at, "flows_complete": bool(flows_file.get("complete")), "assets": costs})
+    return {"ok": True, "done": True, "at_ms": at, "assets": len(costs),
+            "fills": sum(len(p["fills"]) for p in pairs.values())}
+
+
 # ── Probe ───────────────────────────────────────────────────────────────────
 
 EQUITY_STATUSES = "FILLED,PARTIALLY_FILLED,CANCELED,EXPIRED"
@@ -1909,6 +2136,7 @@ COMMANDS = {
     "flows-sync": (cmd_flows_sync, False),
     "deposits-recent": (cmd_deposits_recent, False),
     "stock-quotes": (cmd_stock_quotes, False),
+    "trades-sync": (cmd_trades_sync, False),
     "export-csv": (cmd_export_csv, False),
     "probe": (cmd_probe, False),
     "redact": (cmd_redact, False),

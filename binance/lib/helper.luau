@@ -23,6 +23,11 @@ function M.parse(result, decode, trim): (any, any)
   end
   local data = decode(trim(result.stdout or ""))
   if type(data) ~= "table" then
+    -- No JSON and a failed exit: Python died before answering (a missing or
+    -- broken helper file), not a helper that answered something odd.
+    if type(result.exitCode) == "number" and result.exitCode ~= 0 then
+      return nil, { code = "helper_failed", status = result.exitCode }
+    end
     return nil, { code = "bad_output" }
   end
   if type(data.error) == "string" then

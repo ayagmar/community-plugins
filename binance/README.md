@@ -69,20 +69,21 @@ noctalia msg panel-toggle ayagmar/binance:panel
 
 - **Overview.** Total balance, today's change, its split into crypto, stocks, stablecoins and cash (percentages stay
   visible under the privacy mask), the return on deposits, and a value chart with 7D, 30D, YTD, All and custom
-  ranges. Ranges unlock as the plugin's daily history fills.
+  ranges. Ranges unlock as the plugin's daily history fills. With a target allocation set, a card shows each class
+  against its target and plans your next deposit (see [Target allocation](#target-allocation)).
 - **Holdings.** Every asset with quantity, value and 24h change. Stocks show shares, average cost, unrealized and
-  realized P&L. Small balances are folded away. Click a holding to open it on binance.com: a coin opens its USDT
-  market (USDT its price page), a stock its Binance Stocks page. Without `xdg-open` the click copies the link.
+  realized P&L; coins show the same once their cost basis is known (see [Crypto cost basis](#crypto-cost-basis)). Small
+  balances are folded away. Click a holding to open it on binance.com: a coin opens its USDT market (USDT its price
+  page), a stock its Binance Stocks page. Without `xdg-open` the click copies the link.
 - **Wallets.** Spot, Funding, Earn and the other Binance wallets, plus a Stocks wallet.
 - **Export CSV** (bottom of Holdings). Saves `binance-portfolio-YYYY-MM-DD.csv` in your downloads folder
   (`XDG_DOWNLOAD_DIR`, else `~/Downloads`). It always creates a new file, readable only by you (mode 600), and never
-  writes over an existing file or through a symlink: a second export that day gets `-2`, then `-3`. It holds
-  every holding (kind, asset, quantity, price, value, and for stocks average cost, cost and unrealized P&L) and the
-  return on deposits since your first deposit plus the range picked on Overview, all in the display currency. The
-  export needs the helper (it creates the file), so it works once an account is connected. Binance
-  doesn't report what you paid for crypto, so crypto rows have no cost. Amounts are written even with **Hide amounts**
-  on. A notification names the file and the panel offers **Open**, which hands it to `xdg-open`. Text cells that a
-  spreadsheet would read as a formula start with an apostrophe.
+  writes over an existing file or through a symlink: a second export that day gets `-2`, then `-3`. It holds every
+  holding (kind, asset, quantity, price, value, and average cost, cost and unrealized P&L where known) and the return on
+  deposits since your first deposit plus the range picked on Overview, all in the display currency. The export needs the
+  helper (it creates the file), so it works once an account is connected. A coin without a cost basis has empty cost
+  cells. Amounts are written even with **Hide amounts** on. A notification names the file and the panel offers **Open**,
+  which hands it to `xdg-open`. Text cells that a spreadsheet would read as a formula start with an apostrophe.
 - **Watchlist.** Pairs and stocks to follow, with price alerts: price above, price below, or a 24h move of at least
   some percent. Each alert sends a notification, then waits for its cooldown before it fires again.
 - **Account.** The connect wizard, the verified badge, key rotation, disconnect, the privacy mask and the bar mode.
@@ -177,6 +178,50 @@ everything before EURUSDT listed in January 2020, which no rate from that time c
 Date ranges subtract the flows inside them once every source covers the range. Until then they show a market return,
 which is price moves only and labelled as such.
 
+### Crypto cost basis
+
+Binance doesn't keep what you paid for a coin, so the plugin works it out. Every hour, once your deposit history is
+synced, it reads your spot trades for each coin you hold against USDT, USDC, FDUSD, BTC, ETH, BNB and EUR, and replays
+them in order with your deposits and withdrawals:
+
+- a buy adds what you paid, fees included, and a deposit adds its value when it arrived;
+- a sell, or a trade that paid with the coin, removes cost at the running average and counts as realized P&L;
+- a withdrawal removes cost at the average without a result.
+
+The first read can take a few minutes on an account with many trades; after that only new trades are read. Prices of
+BTC, ETH, BNB and EUR at trade time come from public hourly candles.
+
+Your wallet amount is what gets valued. When the replay doesn't add up to it by more than 1%, the average is marked
+**≈** and its tooltip says why: Earn rewards, Convert trades, airdrops, gifts, and coins bought by card, Buy Crypto or
+P2P in euros aren't in the history. Every average is also marked **≈** until your deposit and withdrawal history is fully
+synced; a history source Binance doesn't offer your account doesn't hold it back. A coin the history never shows coming
+in has no cost basis.
+
+Pairs are found from the coins you hold now. If you spent BTC on a coin you've since sold entirely, and the plugin
+never read that pair while you held the coin, that trade is missing from BTC's replay and its average shows as **≈**.
+
+### Target allocation
+
+Turn on **Target allocation** in the plugin settings and give each asset class a weight: crypto, stocks, stablecoins
+and cash. Weights are relative, so 6, 3 and 1 mean the same as 60, 30 and 10. The Overview then lists each class with
+its share and target, and marks the ones more than the drift band away (5 points by default) as over or under.
+
+To target a single holding, click **Target a holding** on the card, pick it and enter its share of the whole portfolio,
+such as 20% for NVDA. It shows under its class with its own share, target and status, and on its Holdings row. Click
+the row to change or remove it. The rest of the class shares whatever the class target leaves: with stocks at 60% and
+NVDA at 20%, your other stocks aim for 40%. The card warns when a class's holding targets add up to more than the
+class target. To use holding targets alone, set every class weight to 0.
+
+Type an amount under **Next deposit** and the card splits it across the classes and holdings below target, in
+proportion to how far each is short once the money is added, such as "300 NVDA, 300 other stocks, 400 crypto". A
+holding's line also shows about how many shares or coins that buys at today's price. A class with weight 0 is only
+listed once it drifts past the band, so stablecoins you don't target stay out of the way. It only suggests buys: nothing is sold, and the plugin never places an
+order.
+
+With **Notify on drift** on, a class or targeted holding that leaves the band sends one notification. It notifies again
+only after it has come back well inside the band (within 80% of it), and it waits until balances, stocks and prices have all loaded, so a sync in
+progress can't trigger it.
+
 ## Settings
 
 | Setting | Type | Default | Description |
@@ -185,6 +230,10 @@ which is price moves only and labelled as such.
 | `day_boundary` | `select` | `utc` | When "today" starts for today's change: midnight UTC (`utc`, what Binance uses) or your local midnight (`local`). The history chart always uses UTC days. |
 | `daily_summary` | `bool` | `false` | Sends one notification a day with your total, today's change and the biggest mover (the holding worth at least 1% of the portfolio that moved most). With **Hide amounts** on it names percentages only. Needs a connected account. |
 | `daily_summary_time` | `string` | `20:00` | Local time for the daily summary, as `HH:MM` in 24-hour format. If balances or prices are more than 15 minutes old then, the summary waits for the next refresh and skips the day if none comes before midnight. A summary already sent today is not sent again after a restart. |
+| `targets_enabled` | `bool` | `false` | Turns on the target allocation card and drift notifications. |
+| `target_crypto`, `target_stocks`, `target_stable`, `target_other` | `int` | `60`, `30`, `10`, `0` | Relative weight of each class, 0 to 100. `other` is cash (fiat balances). Weights are normalized, so they need not add up to 100. |
+| `drift_band` | `int` | `5` | Percentage points a class can move from its target before it counts as off target. |
+| `drift_notify` | `bool` | `true` | Notifies once when a class or targeted holding leaves the band. |
 
 The bar widget has its own settings, under Settings → Bar on the Binance widget:
 
@@ -244,7 +293,7 @@ noctalia msg plugin ayagmar/binance:service all privacy-toggle   # or privacy-on
   `prices.json`, `history-cache.json`, `account.json`, `balances.json`, `ledger.json`, `marks.json`, `stocks.json`,
   `stock-orders.json`, `stock-orders.json.partial` (while a stocks sync is unfinished), `tokenized-assets.json`,
   `flows.json`, `flows-daily.json`, `stock-quotes.json`, `equity-symbols.json`, `cursors.json`, `clock.json`,
-  `ratelimit-public.json`, `ratelimit-signed.json`, `helper.lock` and `ledger.lock`, plus `export.csv` and
+  `trades.json`, `crypto-costs.json`, `ratelimit-public.json`, `ratelimit-signed.json`, `helper.lock` and `ledger.lock`, plus `export.csv` and
   `export-request.json` for the moment an export is handed to the helper. The only file written elsewhere is the CSV
   that **Export CSV** saves in your downloads folder. Files are written through a `.tmp-…` file and
   renamed; a helper stopped mid-write can leave one behind, and **Disconnect** removes those too.

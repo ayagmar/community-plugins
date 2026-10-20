@@ -789,6 +789,52 @@
   "pnl": 132.3,
   "pct": 0.0162
  },
+ "drift": {
+  "rows": [
+   {
+    "id": "crypto",
+    "value": 7800,
+    "share": 0.78,
+    "target": 0.6,
+    "diff": 0.18
+   },
+   {
+    "id": "stocks",
+    "value": 1700,
+    "share": 0.17,
+    "target": 0.3,
+    "diff": -0.13
+   },
+   {
+    "id": "stable",
+    "value": 500,
+    "share": 0.05,
+    "target": 0.1,
+    "diff": -0.05
+   }
+  ],
+  "band": 0.05,
+  "off": [
+   "crypto",
+   "stocks",
+   "EQ_NVDA"
+  ],
+  "total": 10000,
+  "assets": [
+   {
+    "id": "EQ_NVDA",
+    "asset": "NVDA",
+    "class": "stocks",
+    "value": 1200,
+    "share": 0.12,
+    "target": 0.2,
+    "diff": -0.08
+   }
+  ],
+  "crowded": [
+   "stocks"
+  ]
+ },
  "gaps": [
   "dividends",
   "splits"

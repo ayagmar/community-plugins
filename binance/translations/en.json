@@ -57,6 +57,33 @@
     "desktop_movers": {
       "label": "Show today's top movers",
       "description": "The three holdings that moved most today, stablecoins left out."
+    },
+    "targets_enabled": {
+      "label": "Target allocation",
+      "description": "Set how you want the portfolio split by asset class, and optionally by single holdings (\"20% NVDA\") from the Overview. It shows how far each is from its target and where your next deposit should go."
+    },
+    "target_crypto": {
+      "label": "Crypto weight"
+    },
+    "target_stocks": {
+      "label": "Stocks weight"
+    },
+    "target_stable": {
+      "label": "Stablecoins weight"
+    },
+    "target_other": {
+      "label": "Cash weight"
+    },
+    "target_weight": {
+      "description": "Relative weight. The weights don't need to add up to 100: 6, 3 and 1 mean the same as 60, 30 and 10."
+    },
+    "drift_band": {
+      "label": "Drift band (%)",
+      "description": "How far, in percentage points, a class can move from its target before it counts as off target."
+    },
+    "drift_notify": {
+      "label": "Notify on drift",
+      "description": "Send a notification when a class or targeted holding leaves the band. It notifies again only after it has come back well inside."
     }
   },
   "errors": {
@@ -86,6 +113,7 @@
     "internal": "The helper failed unexpectedly.",
     "timeout": "The helper took too long.",
     "bad_output": "The helper sent an unexpected answer.",
+    "helper_failed": "The helper stopped before answering. Restart the plugin; if it keeps happening, check that binance_helper.py is installed.",
     "spawn_failed": "Couldn't start python3.",
     "unsupported_version": "Cached data is from a newer version of the plugin."
   },
@@ -114,6 +142,10 @@
     "export": {
       "title": "Portfolio exported",
       "body": "{name} in {dir}"
+    },
+    "drift": {
+      "title": "{class} is off target",
+      "body": "{share} of your portfolio, target {target}"
     }
   },
   "bar": {
@@ -191,14 +223,16 @@
       "keygen": "Generating…",
       "store_api_key": "Saving…",
       "verify": "Verifying…",
-      "disconnect": "Disconnecting…"
+      "disconnect": "Disconnecting…",
+      "trades": "Reading trades…"
     },
     "source": {
       "prices": "Prices",
       "balances": "Balances",
       "stocks": "Stocks",
       "flows": "Deposits",
-      "quotes": "Stock quotes"
+      "quotes": "Stock quotes",
+      "trades": "Cost basis"
     },
     "issue": {
       "dependency_title": "{package} is not installed",
@@ -265,6 +299,34 @@
         "stocks": "Stocks",
         "stable": "Stablecoins",
         "other": "Cash"
+      },
+      "drift": {
+        "title": "Target allocation",
+        "target": "target {target}",
+        "on_target": "On target",
+        "edit": "Edit targets",
+        "next_deposit": "Next deposit",
+        "plan_placeholder": "Amount in {currency}",
+        "plan_empty": "Enter an amount to see where it should go.",
+        "plan_none": "Everything is at or above its target; split it by your targets.",
+        "plan_hint": "Buys only. Nothing is sold, and nothing is placed on Binance.",
+        "over": "{pts} pts over",
+        "under": "{pts} pts under",
+        "band_tooltip": "Off target means more than {band} points from the target.",
+        "rest": "Other {class}",
+        "crowded": "Holding targets in {class} add up to more than its class target.",
+        "asset_add": "Target a holding",
+        "asset_edit": "Edit the {asset} target",
+        "asset_placeholder": "Share",
+        "asset_save": "Save",
+        "asset_remove": "Remove",
+        "asset_cancel": "Cancel",
+        "asset_none": "No holding left to target",
+        "asset_bad": "Enter a share between 0 and 100%.",
+        "plan_qty": "≈ {qty}",
+        "asset_now": "now {share}",
+        "plan_left": "{amount} left over: everything you target reaches its target.",
+        "no_targets": "Set class weights in the settings, or target a holding."
       }
     },
     "uncovered": {
@@ -307,6 +369,7 @@
       "avg": "avg {price}",
       "avg_approx": "avg ≈{price}",
       "cost_approx": "Approximate: your order history doesn't add up to the shares in your wallet (a split or transfer?). The wallet count is used.",
+      "cost_approx_crypto": "Approximate: your trades and deposits don't add up to the wallet amount (Earn rewards, Convert or an airdrop?). The wallet amount is used at the average cost of what the history shows.",
       "floating": "Unrealized",
       "cost": "Cost basis {value}",
       "realized": "Realized P&L {value}",

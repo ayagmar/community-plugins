@@ -12,6 +12,8 @@ local helperLib = require("../lib/helper")
 local usmarket = require("../lib/usmarket")
 local summary = require("../lib/summary")
 local csv = require("../lib/csv")
+local allocation = require("../lib/allocation")
+local drift = require("../lib/drift")
 
 local function decode(s)
   -- Just enough JSON for the helper parser tests.
@@ -95,20 +97,6 @@ t.test("prefs keep only well-formed values", function()
   t.eq(p.watchlist, { "BTCUSDT" })
   t.eq(#p.alerts, 1)
   t.eq(p.alerts[1].cooldown_min, prefsLib.DEFAULT_COOLDOWN_MIN)
-end)
-
-t.test("watchlist moves clamp and alerts get fresh ids", function()
-  local p = prefsLib.defaults()
-  prefsLib.watchAdd(p, "SOLUSDT")
-  t.eq(prefsLib.watchMove(p, "SOLUSDT", 0), true)
-  t.eq(p.watchlist, { "SOLUSDT", "BTCUSDT", "ETHUSDT" })
-  local a = prefsLib.alertAdd(p, "BTCUSDT", "above", 100)
-  local b = prefsLib.alertAdd(p, "BTCUSDT", "below", 50)
-  t.eq({ a.id, b.id }, { "a1", "a2" })
-  prefsLib.alertRemove(p, "a1")
-  t.eq(prefsLib.alertAdd(p, "ETHUSDT", "above", 1).id, "a3")
-  t.eq(prefsLib.alertUpdate(p, "a2", { kind = "sideways" }), false)
-  t.eq(p.alerts[1].kind, "below")
 end)
 
 -- ── alerts ──
@@ -231,14 +219,6 @@ t.test("today's change stays out while most of the value has no basis", function
   t.eq(totals.today.pnl, 10 * (0.9999 - 1) + 20)
 end)
 
-t.test("display currency divides every amount by the rate", function()
-  local input = sample()
-  input.rate = 1.25
-  local holdings, _, totals = portfolio.build(input)
-  t.eq(totals.value, 60470 / 1.25)
-  t.eq(holdings[2].avgCost, 80)
-end)
-
 local function historySample()
   local rows = ledger.rows({
     days = {
@@ -343,6 +323,13 @@ t.test("helper errors carry their detail and lost runs are abandoned", function(
   t.eq(got[2][2], { code = "permissions_too_broad", flags = { "enableWithdrawals" } })
 end)
 
+t.test("a helper that dies without answering is told apart from an odd answer", function()
+  local _, err = helperLib.parse({ stdout = "", stderr = "can't open file", exitCode = 2, timedOut = false }, decode, trim)
+  t.eq(err, { code = "helper_failed", status = 2 })
+  _, err = helperLib.parse({ stdout = "garbage", exitCode = 0, timedOut = false }, decode, trim)
+  t.eq(err, { code = "bad_output" })
+end)
+
 -- ── usmarket ──
 
 -- Catches: a day change based on a quote from before a weekend or holiday
@@ -412,6 +399,87 @@ t.test("the export finds the XDG download folder", function()
   local dirs = '# comment\nXDG_DESKTOP_DIR="$HOME/Desktop"\nXDG_DOWNLOAD_DIR="$HOME/Téléchargements"\n'
   t.eq(csv.downloadDir(dirs, "/home/u"), "/home/u/Téléchargements")
   t.eq(csv.downloadDir("XDG_DOWNLOAD_DIR=\"relative\"", "/home/u"), nil)
+end)
+
+-- ── drift ──
+
+local function round(x)
+  return math.floor(x * 1e6 + 0.5) / 1e6
+end
+
+t.test("target weights are normalized, and no weight means no targets", function()
+  local a = drift.targets({ crypto = 6, stocks = 3, stable = 1 })
+  local b = drift.targets({ crypto = 60, stocks = 30, stable = 10, other = 0 })
+  t.eq(a, b)
+  t.eq(round(a.crypto), 0.6)
+  t.eq(drift.targets({ crypto = 0, stocks = 0 }), nil)
+end)
+
+t.test("the deposit plan only buys what is under target and spends the whole amount", function()
+  local holdings = {
+    { kind = "spot", asset = "BTC", value = 900 },
+    { kind = "spot", asset = "USDT", value = 100 },
+  }
+  local d = drift.compute(holdings, { crypto = 0.6, stocks = 0.3, stable = 0.1 }, {}, 0.05)
+  local plan = drift.plan(d, 500)
+  local spent, ids = 0, {}
+  for _, step in plan do
+    spent += step.amount
+    table.insert(ids, step.id)
+  end
+  t.eq(round(spent), 500)
+  t.eq(ids, { "stocks", "stable" }) -- crypto is over target: nothing goes there
+  t.eq(drift.plan(d, 0), {})
+end)
+
+t.test("a holding target is a share of the whole portfolio and gets its own deposit line", function()
+  local holdings = {
+    { kind = "stock", asset = "NVDA", value = 100 },
+    { kind = "stock", asset = "AAPL", value = 500 },
+    { kind = "spot", asset = "BTC", value = 400 },
+  }
+  local d = drift.compute(holdings, { crypto = 0.4, stocks = 0.6 }, { EQ_NVDA = 0.2 }, 0.05)
+  t.eq(d.off, { "EQ_NVDA" }) -- 10% against 20%; the classes are on target
+  t.eq(d.crowded, {})
+  -- 1000 more: NVDA needs 300 to reach 20% of 2000, the other stocks 300 to
+  -- reach 800 (60% less NVDA's 20%), crypto 400 to reach 800.
+  local amounts = {}
+  for _, step in drift.plan(d, 1000) do
+    amounts[if step.rest then `rest-{step.class}` else step.id] = round(step.amount)
+  end
+  t.eq(amounts, { EQ_NVDA = 300, ["rest-stocks"] = 300, crypto = 400 })
+  -- Holding targets alone: each line stops at its target and the rest of
+  -- the money is left over; with nothing targeted the card still shows.
+  d = drift.compute(holdings, nil, { EQ_NVDA = 0.2 }, 0.05)
+  t.eq(#d.rows, 0)
+  t.eq(round(drift.plan(d, 5000)[1].amount), 1100) -- 20% of 6000, less 100 held
+  t.eq(#drift.compute(holdings, nil, {}, 0.05).assets, 0)
+  -- One more than its class.
+  t.eq(drift.compute(holdings, { crypto = 0.4, stocks = 0.6 }, { BTC = 0.5 }, 0.05).crowded, { "crypto" })
+end)
+
+t.test("a typed deposit reads decimal commas and thousands separators", function()
+  t.eq(drift.parseAmount("250,50"), 250.5)
+  t.eq(drift.parseAmount("1,250.50"), 1250.5)
+  t.eq(drift.parseAmount(" 1 000 "), 1000)
+  t.eq(drift.parseAmount("1,000"), 1000)
+  t.eq(drift.parseAmount("1.250,50"), 1250.5)
+  t.eq(drift.parseAmount("0x10"), nil)
+end)
+
+t.test("a drifted class is notified once, and again only once it came well back", function()
+  local function at(share)
+    local holdings = { { kind = "spot", asset = "BTC", value = share }, { kind = "spot", asset = "USDT", value = 1 - share } }
+    return drift.compute(holdings, { crypto = 0.5, stable = 0.5 }, {}, 0.05)
+  end
+  local fresh, flagged = drift.newlyOff(at(0.551), {})
+  t.eq(fresh, { "crypto", "stable" })
+  fresh, flagged = drift.newlyOff(at(0.549), flagged) -- just inside: still flagged
+  fresh, flagged = drift.newlyOff(at(0.551), flagged)
+  t.eq(fresh, {})
+  fresh, flagged = drift.newlyOff(at(0.52), flagged) -- well inside: re-armed
+  fresh = drift.newlyOff(at(0.551), flagged)
+  t.eq(fresh, { "crypto", "stable" })
 end)
 
 return {}

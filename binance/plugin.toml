@@ -18,7 +18,7 @@
 
 id = "ayagmar/binance"
 name = "Binance"
-version = "0.1.0"
+version = "0.2.0"
 plugin_api = 32
 author = "ayagmar"
 license = "MIT"
@@ -68,6 +68,73 @@ label_key = "settings.daily_summary_time.label"
 description_key = "settings.daily_summary_time.description"
 default = "20:00"
 visible_when = { key = "daily_summary", values = ["true"] }
+
+# Target allocation by asset class. The weights are normalized, so they need
+# not add up to 100.
+[[setting]]
+key = "targets_enabled"
+type = "bool"
+label_key = "settings.targets_enabled.label"
+description_key = "settings.targets_enabled.description"
+default = false
+
+[[setting]]
+key = "target_crypto"
+type = "int"
+label_key = "settings.target_crypto.label"
+description_key = "settings.target_weight.description"
+default = 60
+min = 0
+max = 100
+visible_when = { key = "targets_enabled", values = ["true"] }
+
+[[setting]]
+key = "target_stocks"
+type = "int"
+label_key = "settings.target_stocks.label"
+description_key = "settings.target_weight.description"
+default = 30
+min = 0
+max = 100
+visible_when = { key = "targets_enabled", values = ["true"] }
+
+[[setting]]
+key = "target_stable"
+type = "int"
+label_key = "settings.target_stable.label"
+description_key = "settings.target_weight.description"
+default = 10
+min = 0
+max = 100
+visible_when = { key = "targets_enabled", values = ["true"] }
+
+[[setting]]
+key = "target_other"
+type = "int"
+label_key = "settings.target_other.label"
+description_key = "settings.target_weight.description"
+default = 0
+min = 0
+max = 100
+visible_when = { key = "targets_enabled", values = ["true"] }
+
+[[setting]]
+key = "drift_band"
+type = "int"
+label_key = "settings.drift_band.label"
+description_key = "settings.drift_band.description"
+default = 5
+min = 1
+max = 50
+visible_when = { key = "targets_enabled", values = ["true"] }
+
+[[setting]]
+key = "drift_notify"
+type = "bool"
+label_key = "settings.drift_notify.label"
+description_key = "settings.drift_notify.description"
+default = true
+visible_when = { key = "targets_enabled", values = ["true"] }
 
 # ── Entries ─────────────────────────────────────────────────────────────────
 

@@ -19,6 +19,8 @@ local flowsLib = require("./lib/flows.luau")
 local days = require("./lib/days.luau")
 local usmarket = require("./lib/usmarket.luau")
 local summaryLib = require("./lib/summary.luau")
+local allocation = require("./lib/allocation.luau")
+local driftLib = require("./lib/drift.luau")
 local fmt = require("./ui/fmt.luau")
 local csv = require("./lib/csv.luau")
 local fs = require("./lib/fs.luau")
@@ -30,6 +32,7 @@ local BALANCES_MS = 5 * 60000
 local STOCKS_WEEKDAY_MS = 5 * 60000
 local STOCKS_WEEKEND_MS = 30 * 60000
 local FLOWS_MS = 3600000
+local TRADES_MS = 3600000
 local FLOWS_RETRY_MAX_MS = 3600000
 local VERIFY_MS = 24 * 3600000
 local VERIFY_RETRY_MS = 3600000
@@ -86,6 +89,8 @@ local flows = flowsLib.parse(readJson("flows-daily.json"))
 -- the helper's stock-quotes (the quote endpoint needs the API key).
 local stockQuotes = readJson("stock-quotes.json")
 local equityList = readJson("equity-symbols.json")
+-- Crypto cost basis from the helper's trades-sync (spot fills plus flows).
+local cryptoCosts = readJson("crypto-costs.json")
 
 -- symbol -> market.Ticker; warm-started from the last fetch, marked stale.
 local tickers: { [string]: any } = {}
@@ -133,8 +138,8 @@ local historyVersion = 0
 local historyCache: any = nil
 local rangeMemo: any = nil
 
-local nextAt = { prices = 0, balances = 0, stocks = 0, flows = 0, quotes = 0, daily = 0, verify = 0 }
-local failures = { balances = 0, stocks = 0, flows = 0, quotes = 0 }
+local nextAt = { prices = 0, balances = 0, stocks = 0, flows = 0, quotes = 0, trades = 0, daily = 0, verify = 0 }
+local failures = { balances = 0, stocks = 0, flows = 0, quotes = 0, trades = 0 }
 if flows ~= nil and flows.ready then
   nextAt.flows = flows.at + FLOWS_MS -- caught up before the reload
 end
@@ -180,6 +185,8 @@ local function savePrefs()
     watchlist = prefs.watchlist,
     alerts = prefs.alerts,
     summary_day = prefs.summary_day,
+    drift_flagged = prefs.drift_flagged,
+    asset_targets = prefs.asset_targets,
   })
 end
 
@@ -313,6 +320,7 @@ local function statusView()
       elseif running == "flows-sync" then "flows"
       elseif running == "deposits-recent" then "balances"
       elseif running == "stock-quotes" then "prices"
+      elseif running == "trades-sync" then "trades"
       elseif running == "store-api-key" then "store_api_key"
       elseif running == "recheck" then "verify"
       else running
@@ -551,6 +559,46 @@ local function historyView(input, points)
   return { from = days.fromNumber(firstN), to = days.fromNumber(lastN), days = points, presets = presets }
 end
 
+-- Drift from the target allocation (settings), or nil when targets are off.
+-- Notifies once per class that leaves the band, and only once balances,
+-- stocks and prices have all loaded (or stocks failed: an account without
+-- Binance Stocks), so a half-synced portfolio cannot look drifted.
+local function driftView(holdings)
+  if noctalia.getConfig("targets_enabled") ~= true then
+    return nil
+  end
+  local weights = {}
+  for _, id in allocation.ORDER do
+    weights[id] = tonumber(noctalia.getConfig(`target_{id}`))
+  end
+  local band = (tonumber(noctalia.getConfig("drift_band")) or driftLib.DEFAULT_BAND * 100) / 100
+  local d = driftLib.compute(holdings, driftLib.targets(weights), prefs.asset_targets, band)
+  local stocksPending = stocks == nil and not (sources.stocks and sources.stocks.error)
+  if d == nil or balances == nil or stocksPending or not tickersFresh then
+    return d
+  end
+  local fresh, flagged = driftLib.newlyOff(d, prefs.drift_flagged)
+  if noctalia.getConfig("drift_notify") ~= false then
+    local function notifyRow(row, name)
+      if table.find(fresh, row.id) then
+        local subst = { class = name, share = fmt.share(row.share), target = fmt.share(row.target) }
+        noctalia.notify(noctalia.tr("notify.drift.title", subst), noctalia.tr("notify.drift.body", subst))
+      end
+    end
+    for _, row in d.rows do
+      notifyRow(row, noctalia.tr(`panel.overview.class.{row.id}`))
+    end
+    for _, row in d.assets do
+      notifyRow(row, row.asset)
+    end
+  end
+  if table.concat(flagged, ",") ~= table.concat(prefs.drift_flagged, ",") then
+    prefs.drift_flagged = flagged
+    savePrefs()
+  end
+  return d
+end
+
 local function publish()
   local r = rate()
   local cur = if r == nil then "USDT" else currency()
@@ -602,6 +650,7 @@ local function publish()
       stocks = stocks,
       prices = assetPrices(),
       prevMarks = prevMarks(historyCache.marks),
+      costs = cryptoCosts and cryptoCosts.assets,
       rate = r,
     })
     totals.netDeposit = flowsLib.netDeposit(flows, totals.value, cur == "EUR")
@@ -611,6 +660,7 @@ local function publish()
       end
     end
     report.holdings, report.wallets, report.totals = holdings, wallets, totals
+    report.drift = driftView(holdings)
     local points = historyCache.points
     if #points > 0 then
       -- The chart ends at the live total, less what history values at 0:
@@ -890,7 +940,10 @@ end
 -- Retry delay after the source's n-th failure in a row.
 local function backoff(name: string): number
   failures[name] += 1
-  local interval = if name == "stocks" then stocksInterval() elseif name == "flows" then FLOWS_RETRY_MAX_MS else BALANCES_MS
+  local interval = if name == "stocks"
+    then stocksInterval()
+    elseif name == "flows" or name == "trades" then FLOWS_RETRY_MAX_MS
+    else BALANCES_MS
   return math.min(30000 * 2 ^ (failures[name] - 1), interval)
 end
 
@@ -983,6 +1036,31 @@ runStocks = function(user: boolean)
       marksRaw = readJson("marks.json")
       historyVersion += 1
       sourceOk("stocks")
+    end
+    publish()
+  end)
+end
+
+-- Crypto cost basis: hourly, once flows are caught up (deposits are part of
+-- the replay) and balances say which coins are held. Chunks continue at once.
+local runTrades
+
+runTrades = function(user: boolean)
+  nextAt.trades = now() + TRADES_MS
+  helper.submit("trades-sync", user, function(data, err)
+    if err ~= nil then
+      nextAt.trades = now() + signedFailure("trades", err)
+    elseif data.done == false then
+      local wait = tonumber(data.wait_ms) or 0
+      if wait > 0 then
+        nextAt.trades = now() + wait -- near Binance's per-minute IP weight
+      elseif signedAllowed() then
+        runTrades(user)
+      end
+    else
+      failures.trades = 0
+      cryptoCosts = readJson("crypto-costs.json")
+      sourceOk("trades")
     end
     publish()
   end)
@@ -1112,7 +1190,7 @@ end
 local function disconnect()
   runAccountCommand("disconnect", true, function()
     account, balances, stocks, ledgerRaw, marksRaw, flows = nil, nil, nil, nil, nil, nil
-    stockQuotes, equityList = nil, nil
+    stockQuotes, equityList, cryptoCosts = nil, nil, nil
     historyVersion += 1
     sources = { prices = sources.prices }
   end)
@@ -1364,6 +1442,8 @@ local function onCommand(command)
   elseif action == "alert_update" and type(command.id) == "string" then
     changed = prefsLib.alertUpdate(prefs, command.id, command)
     armed[command.id] = nil
+  elseif action == "set_asset_target" and type(command.key) == "string" then
+    changed = prefsLib.setAssetTarget(prefs, command.key, command.share)
   elseif action == "alert_remove" and type(command.id) == "string" then
     changed = prefsLib.alertRemove(prefs, command.id)
   elseif action == "set_range" and type(command.preset) == "string" then
@@ -1456,6 +1536,11 @@ local function tick()
     end
     if t >= nextAt.quotes and #prefsLib.watchedStocks(prefs) > 0 then
       runStockQuotes(false)
+    end
+    -- The least urgent sync: it waits for an idle helper, so balances and
+    -- the deposits read with them never queue behind it.
+    if t >= nextAt.trades and balances ~= nil and flows ~= nil and flows.ready and helper.current() == nil then
+      runTrades(false)
     end
   end
   publish()

@@ -5,6 +5,7 @@
 
 local state = require("../lib/state.luau")
 local allocation = require("../lib/allocation.luau")
+local driftLib = require("../lib/drift.luau")
 local fmt = require("./fmt.luau")
 local parts = require("./parts.luau")
 
@@ -69,6 +70,301 @@ local function allocationView(report)
     ui.row({ gap = 2, height = 6 }, segments),
     ui.row({ gap = 12 }, columns),
   })
+end
+
+local function statusLabel(r, off: boolean)
+  return ui.label({
+    text = if off
+      then tr(if r.diff > 0 then "panel.overview.drift.over" else "panel.overview.drift.under", { pts = string.format("%.1f", math.abs(r.diff) * 100) })
+      else tr("panel.overview.drift.on_target"),
+    fontSize = 11,
+    fontWeight = if off then "semibold" else "normal",
+    color = if off then "error" else "on_surface_variant",
+    width = 84,
+    textAlign = "end",
+  })
+end
+
+-- Share, target and status columns, shared by class and holding rows.
+local function targetColumns(r, d)
+  return {
+    ui.label({ text = fmt.share(r.share), fontSize = 12, fontWeight = "medium" }),
+    parts.caption(tr("panel.overview.drift.target", { target = fmt.share(r.target) }), nil, { width = 80, textAlign = "end" }),
+    statusLabel(r, table.find(d.off, r.id) ~= nil),
+  }
+end
+
+-- A holding's target row, indented under its class; clicking it edits it.
+local function assetRow(a, d, ctx)
+  local cells = {
+    ui.column({ width = 15 }, {}), -- indents the holding under its class
+    ui.label({ text = a.asset, fontSize = 12, color = "on_surface", flexGrow = 1 }),
+  }
+  for _, cell in targetColumns(a, d) do
+    table.insert(cells, cell)
+  end
+  return ui.row({
+    gap = 8,
+    align = "center",
+    key = `asset-{a.id}`,
+    tooltip = tr("panel.overview.drift.asset_edit", { asset = a.asset }),
+    onClick = function()
+      ctx.targetForm = { edit = true, key = a.id, value = string.format("%g", math.floor(a.target * 10000 + 0.5) / 100), seed = (ctx.targetForm and ctx.targetForm.seed or 0) + 1 }
+      ctx.render()
+    end,
+  }, cells)
+end
+
+-- Add or edit one holding's target: the holding (fixed when editing), its
+-- share of the portfolio in percent, then save, remove and cancel.
+local function targetForm(report, d, ctx)
+  local form = ctx.targetForm
+  local editing = form.edit == true
+  local keys, labels = {}, {}
+  if editing then
+    keys = { form.key }
+  else
+    local targeted = {}
+    for _, a in d.assets do
+      targeted[a.id] = true
+    end
+    for _, h in report.holdings or {} do
+      local k = driftLib.key(h.kind, h.asset)
+      if not targeted[k] and not table.find(keys, k) and (h.value or 0) > 0 then
+        table.insert(keys, k)
+      end
+    end
+  end
+  for i, k in keys do
+    labels[i] = if string.sub(k, 1, 3) == "EQ_" then string.sub(k, 4) else k
+  end
+  if form.key == nil or not table.find(keys, form.key) then
+    form.key = keys[1]
+  end
+
+  -- The selected holding's share now, as the hint in the empty field.
+  local shareNow = nil
+  for _, h in report.holdings or {} do
+    if form.key and driftLib.key(h.kind, h.asset) == form.key and d.total > 0 then
+      shareNow = (shareNow or 0) + (h.value or 0) / d.total
+    end
+  end
+
+  local function save()
+    local pct = driftLib.parseAmount(tostring(form.value))
+    if form.key == nil then
+      form.error = tr("panel.overview.drift.asset_none")
+    elseif pct == nil or pct <= 0 or pct > 100 then
+      form.error = tr("panel.overview.drift.asset_bad")
+    else
+      state.setAssetTarget(form.key, pct / 100)
+      ctx.targetForm = nil
+    end
+    ctx.render()
+  end
+
+  return ui.column({ gap = 6, key = "target-form" }, parts.nodes(
+    ui.row({ gap = 6, align = "center" }, parts.nodes(
+      ui.select({
+        key = `target-asset-{form.seed}`,
+        options = if #keys > 0 then labels else { tr("panel.overview.drift.asset_none") },
+        selectedIndex = (table.find(keys, form.key) or 1) - 1,
+        enabled = not editing and #keys > 0,
+        controlSize = "sm",
+        flexGrow = 1,
+        onChange = function(index)
+          form.key = keys[(tonumber(index) or 0) + 1]
+          ctx.render()
+        end,
+      }),
+      ui.input({
+        key = `target-value-{form.seed}`,
+        value = tostring(form.value or ""),
+        placeholder = if shareNow then tr("panel.overview.drift.asset_now", { share = fmt.share(shareNow) }) else tr("panel.overview.drift.asset_placeholder"),
+        controlSize = "sm",
+        width = 70,
+        onChange = function(text)
+          form.value = text
+        end,
+        onSubmit = save,
+      }),
+      parts.caption("%")
+    )),
+    if form.error then parts.caption(form.error, "error") else nil,
+    ui.row({ gap = 6, align = "center" }, parts.nodes(
+      ui.button({ text = tr("panel.overview.drift.asset_save"), variant = "primary", controlSize = "sm", enabled = form.key ~= nil, onClick = save }),
+      if editing
+        then ui.button({
+          text = tr("panel.overview.drift.asset_remove"),
+          variant = "ghost",
+          controlSize = "sm",
+          onClick = function()
+            state.setAssetTarget(form.key, nil)
+            ctx.targetForm = nil
+            ctx.render()
+          end,
+        })
+        else nil,
+      ui.button({
+        text = tr("panel.overview.drift.asset_cancel"),
+        variant = "ghost",
+        controlSize = "sm",
+        onClick = function()
+          ctx.targetForm = nil
+          ctx.render()
+        end,
+      })
+    ))
+  ))
+end
+
+-- An estimate to buy: two decimals from 1 up, six below ("1.62", "0.004123").
+local function roughQty(q: number, privacy: boolean): string
+  if privacy then
+    return fmt.MASK
+  end
+  local text = string.format(if q >= 1 then "%.2f" else "%.6f", q):gsub("0+$", ""):gsub("%.$", "")
+  return text
+end
+
+local function planLabel(step): string
+  if step.asset then
+    return step.asset
+  end
+  local class = tr(`panel.overview.class.{step.class}`)
+  return if step.rest then tr("panel.overview.drift.rest", { class = class }) else class
+end
+
+-- Target allocation: each class against its target with its targeted
+-- holdings under it, then a deposit planner that splits new money toward
+-- what is below target.
+local function driftCard(report, ctx)
+  local d = report.drift
+  if d == nil then
+    return nil
+  end
+  local currency, privacy = report.currency, report.privacy
+  local rows = {}
+  local shown: { [string]: boolean } = {}
+  for _, r in d.rows do
+    local hasAssets = false
+    for _, a in d.assets do
+      hasAssets = hasAssets or a.class == r.id
+    end
+    -- A class you don't target (weight 0) only matters once it drifts.
+    if r.target == 0 and not hasAssets and not table.find(d.off, r.id) then
+      continue
+    end
+    local cells = {
+      ui.box({ width = 7, height = 7, radius = 4, fill = CLASS_COLORS[r.id] }),
+      ui.label({ text = tr(`panel.overview.class.{r.id}`), fontSize = 12, color = "on_surface", flexGrow = 1 }),
+    }
+    for _, cell in targetColumns(r, d) do
+      table.insert(cells, cell)
+    end
+    table.insert(rows, ui.row({ gap = 8, align = "center", key = r.id }, cells))
+    for _, a in d.assets do
+      if a.class == r.id then
+        table.insert(rows, assetRow(a, d, ctx))
+        shown[a.id] = true
+      end
+    end
+  end
+  for _, a in d.assets do
+    if not shown[a.id] then
+      table.insert(rows, assetRow(a, d, ctx))
+    end
+  end
+  for _, id in d.crowded do
+    table.insert(rows, parts.caption(tr("panel.overview.drift.crowded", { class = tr(`panel.overview.class.{id}`) }), "error", { key = `crowded-{id}`, maxLines = 2 }))
+  end
+  if ctx.targetForm then
+    table.insert(rows, targetForm(report, d, ctx))
+  else
+    table.insert(rows, ui.button({
+      key = "add-target",
+      text = tr("panel.overview.drift.asset_add"),
+      glyph = "plus",
+      variant = "ghost",
+      controlSize = "sm",
+      contentAlign = "start",
+      onClick = function()
+        ctx.targetForm = { value = "", seed = 1 }
+        ctx.render()
+      end,
+    }))
+  end
+
+  local amount = driftLib.parseAmount(ctx.depositDraft or "")
+  local planRows = {}
+  if #d.rows == 0 and #d.assets == 0 then
+    table.insert(planRows, parts.caption(tr("panel.overview.drift.no_targets"), nil, { maxLines = 2 }))
+  elseif amount == nil or amount <= 0 then
+    table.insert(planRows, parts.caption(tr("panel.overview.drift.plan_empty"), nil, { maxLines = 2 }))
+  else
+    local plan = driftLib.plan(d, amount)
+    if #plan == 0 then
+      table.insert(planRows, parts.caption(tr("panel.overview.drift.plan_none"), nil, { maxLines = 2 }))
+    end
+    local prices = {}
+    for _, h in report.holdings or {} do
+      if h.price and h.price > 0 then
+        prices[driftLib.key(h.kind, h.asset)] = h.price
+      end
+    end
+    for _, step in plan do
+      local price = if step.asset then prices[step.id] else nil
+      table.insert(planRows, ui.row({ gap = 8, align = "center", key = `plan-{step.id}` }, parts.nodes(
+        ui.glyph({ name = "arrow-right", size = 12, color = CLASS_COLORS[step.class] }),
+        ui.label({ text = planLabel(step), fontSize = 12, flexGrow = 1 }),
+        -- What the amount buys at today's price: "≈ 1.62 sh", "≈ 0.0041 BTC".
+        if price
+          then parts.caption(tr("panel.overview.drift.plan_qty", {
+            qty = if string.sub(step.id, 1, 3) == "EQ_"
+              then tr("panel.holdings.shares", { qty = roughQty(step.amount / price, privacy) })
+              else `{roughQty(step.amount / price, privacy)} {step.asset}`,
+          }))
+          else nil,
+        ui.label({ text = fmt.money(step.amount, currency, { privacy = privacy }), fontSize = 12, fontWeight = "semibold" })
+      )))
+    end
+    local spent = 0
+    for _, step in plan do
+      spent += step.amount
+    end
+    if #plan > 0 and amount - spent > amount * 0.001 then
+      table.insert(planRows, parts.caption(tr("panel.overview.drift.plan_left", { amount = fmt.money(amount - spent, currency, { privacy = privacy }) }), nil, { maxLines = 2 }))
+    end
+  end
+
+  return parts.card(parts.nodes(
+    parts.section(tr("panel.overview.drift.title"), ui.button({
+      text = tr("panel.overview.drift.edit"),
+      variant = "ghost",
+      controlSize = "sm",
+      onClick = function()
+        ctx.openSettings()
+      end,
+    })),
+    ui.column({ gap = 6, tooltip = tr("panel.overview.drift.band_tooltip", { band = string.format("%g", d.band * 100) }) }, rows),
+    ui.separator({ color = "outline/0.2" }),
+    ui.row({ gap = 8, align = "center" }, {
+      parts.title(tr("panel.overview.drift.next_deposit"), { flexGrow = 1 }),
+      ui.input({
+        key = `deposit-{ctx.depositSeed or 0}`,
+        value = ctx.depositDraft or "",
+        placeholder = tr("panel.overview.drift.plan_placeholder", { currency = currency }),
+        controlSize = "sm",
+        width = 170,
+        onChange = function(text)
+          ctx.depositDraft = text
+          ctx.render()
+        end,
+      }),
+    }),
+    ui.column({ gap = 4 }, planRows),
+    parts.caption(tr("panel.overview.drift.plan_hint"), nil, { maxLines = 2 })
+  ), { key = "drift" })
 end
 
 local function hero(report, ctx)
@@ -464,6 +760,7 @@ function M.render(report, ctx): { any }
   end
   return parts.nodes(
     hero(report, ctx),
+    driftCard(report, ctx),
     if report.history then chart(report, ctx) else nil,
     gapsNote(report)
   )

@@ -7,6 +7,7 @@
 
 local state = require("../lib/state.luau")
 local links = require("../lib/links.luau")
+local driftLib = require("../lib/drift.luau")
 local fmt = require("./fmt.luau")
 local parts = require("./parts.luau")
 
@@ -84,6 +85,18 @@ local function quoteBadge(h)
   })
 end
 
+-- "target 20%" beside a holding with a target in the Overview.
+local function targetTag(h, report)
+  local d = report.drift
+  local key = driftLib.key(h.kind, h.asset)
+  for _, a in if d then d.assets else {} do
+    if a.id == key then
+      return parts.caption(tr("panel.overview.drift.target", { target = fmt.share(a.target) }), if table.find(d.off, key) then "error" else nil)
+    end
+  end
+  return nil
+end
+
 local function detailLine(h, report): string
   local privacy, currency = report.privacy, report.currency
   local qty = fmt.qty(h.qty, privacy)
@@ -94,17 +107,21 @@ local function detailLine(h, report): string
     end
     return text
   end
-  return `{qty} {h.asset} · {fmt.money(h.price, currency)}`
+  local text = `{qty} {h.asset} · {fmt.money(h.price, currency)}`
+  if h.avgCost then
+    text ..= " · " .. tr(if h.costApprox then "panel.holdings.avg_approx" else "panel.holdings.avg", { price = fmt.money(h.avgCost, currency) })
+  end
+  return text
 end
 
-local function stockTooltip(h, report): string?
+local function costTooltip(h, report): string?
   local lines = {}
   local privacy, currency = report.privacy, report.currency
   if h.cost then
     table.insert(lines, tr("panel.holdings.cost", { value = fmt.money(h.cost, currency, { privacy = privacy }) }))
   end
   if h.costApprox then
-    table.insert(lines, tr("panel.holdings.cost_approx"))
+    table.insert(lines, tr(if h.kind == "stock" then "panel.holdings.cost_approx" else "panel.holdings.cost_approx_crypto"))
   end
   if h.realized then
     table.insert(lines, tr("panel.holdings.realized", { value = fmt.money(h.realized, currency, { signed = true, privacy = privacy }) }))
@@ -141,7 +158,8 @@ local function holdingRow(h, report, ctx)
       if h.kind == "stock"
         then parts.session(h.session) or ui.label({ text = tr("panel.holdings.stock_tag"), fontSize = 9, fontWeight = "semibold", color = "on_surface_variant" })
         else nil,
-      quoteBadge(h)
+      quoteBadge(h),
+      targetTag(h, report)
     )),
     parts.caption(detailLine(h, report), nil, { maxLines = 1 }),
   })
@@ -162,18 +180,25 @@ local function holdingRow(h, report, ctx)
 
   local key = `{h.kind}:{h.asset}`
   local link = linkProps(h, ctx)
+  local top
   if h.kind ~= "stock" then
     -- The sparkline sits in the amount's row so the 12 px between them is a
     -- gap, not centring inside a wider column (which left ~8 px on screen).
     local trailing = ui.row({ gap = 12, align = "center" }, { parts.spark(h.spark, 72, 22), right })
-    return ui.row(parts.merge({ gap = 8, align = "center", key = key, paddingV = 4 }, link), { left, trailing })
+    if h.avgCost == nil then
+      return ui.row(parts.merge({ gap = 8, align = "center", key = key, paddingV = 4 }, link), { left, trailing })
+    end
+    top = ui.row({ gap = 8, align = "center", tooltip = link.tooltip }, { left, trailing })
+  else
+    top = ui.row({ gap = 8, align = "center", tooltip = link.tooltip }, { left, right })
   end
 
-  -- Stocks: floating P&L gets its own full-width line under the row. The
-  -- link's hover text sits on the top line, so the P&L line keeps its own.
+  -- With a cost basis, floating P&L gets its own full-width line under the
+  -- row. The link's hover text sits on the top line, so the P&L line keeps
+  -- its own.
   return ui.column({ gap = 4, key = key, paddingV = 4, onClick = link.onClick }, {
-    ui.row({ gap = 8, align = "center", tooltip = link.tooltip }, { left, right }),
-    ui.row({ gap = 6, align = "center", tooltip = stockTooltip(h, report) }, {
+    top,
+    ui.row({ gap = 6, align = "center", tooltip = costTooltip(h, report) }, {
       parts.caption(tr("panel.holdings.floating")),
       if h.floating then parts.pnl(h.floating, currency, privacy, 11) else parts.caption("—"),
     }),

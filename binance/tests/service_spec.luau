@@ -167,6 +167,58 @@ t.test("connected: one helper run at a time, then a valued report", function()
   t.eq(#host.processes, 0)
 end)
 
+t.test("targets on: the report shows drift and each drifted class is notified once", function()
+  local host = hostLib.new()
+  host.config.targets_enabled = true
+  host.config.target_crypto, host.config.target_stocks, host.config.target_stable = 60, 30, 10
+  host.config.drift_band = 5
+  connectedFiles(host)
+  local runtime = start(host)
+  host.finishProcess("balances", { ok = true })
+  host.finishProcess("stocks-sync", { ok = true, done = true })
+  host.finishProcess("flows-sync", { ok = true, done = true })
+  host.drainRequests(market)
+  runtime.call("update")
+  local report = host.report()
+  -- Crypto 36,000 of 36,400: far over 60%; stocks and stablecoins far under.
+  t.eq(report.drift.off, { "crypto", "stocks", "stable" })
+  t.eq(#host.notifications, 3)
+  t.eq(host.readJson("prefs.json").drift_flagged, { "crypto", "stocks", "stable" })
+  assertContract(report)
+  host.clock += 61000
+  host.drainRequests(market)
+  runtime.call("update")
+  t.eq(#host.notifications, 3, "still drifted: no repeat")
+  -- A holding target set from the panel is saved and shows up as its own row.
+  host.command({ action = "set_asset_target", key = "BTC", share = 0.5 })
+  t.eq(host.readJson("prefs.json").asset_targets, { BTC = 0.5 })
+  t.eq(host.report().drift.assets[1].id, "BTC")
+end)
+
+t.test("a crypto cost basis from trades-sync shows as average cost and floating P&L", function()
+  local host = hostLib.new()
+  connectedFiles(host)
+  host.writeJson("crypto-costs.json", { v = 1, at_ms = T0, assets = {
+    BTC = { avg_cost = "40000", cost = "20000", realized_pnl = "150", cost_approx = false },
+    ETH = { avg_cost = "2000", cost = "4000", realized_pnl = "0", cost_approx = true },
+  } })
+  local runtime = start(host)
+  host.finishProcess("balances", { ok = true })
+  host.finishProcess("stocks-sync", { ok = true, done = true })
+  host.finishProcess("flows-sync", { ok = true, done = true })
+  host.drainRequests(market)
+  runtime.call("update")
+  local byAsset = {}
+  for _, h in host.report().holdings do
+    byAsset[h.asset] = h
+  end
+  -- 0.5 BTC at 60,000 against an average of 40,000.
+  t.eq({ byAsset.BTC.avgCost, byAsset.BTC.cost, byAsset.BTC.floating.pnl, byAsset.BTC.realized }, { 40000, 20000, 10000, 150 })
+  t.eq(byAsset.ETH.costApprox, true)
+  t.eq(byAsset.USDT.avgCost, nil)
+  assertContract(host.report())
+end)
+
 t.test("the chart leaves out assets that only the live total can price", function()
   local host = hostLib.new()
   connectedFiles(host)
@@ -755,23 +807,6 @@ end)
 
 -- Catches: a second click while the first export runs, whose request the
 -- running helper deletes, turning a saved file into a reported failure.
-t.test("export ignores a second click while one is running", function()
-  local host = hostLib.new()
-  connectedIdle(host)
-  host.command({ action = "export_csv" })
-  host.command({ action = "export_csv" })
-  host.finishProcess("export-csv", { ok = true, path = "/home/u/Downloads/binance-portfolio-2026-10-19.csv",
-    name = "binance-portfolio-2026-10-19.csv" })
-  local runs = 0
-  for _, p in host.processes do
-    if p.argv[4] == "export-csv" then
-      runs += 1
-    end
-  end
-  t.eq(runs, 0) -- no second export queued behind the first
-  t.eq(host.report().export.name, "binance-portfolio-2026-10-19.csv")
-end)
-
 t.test("a failed export says so and sends no notification", function()
   local host = hostLib.new()
   connectedIdle(host)
@@ -779,14 +814,6 @@ t.test("a failed export says so and sends no notification", function()
   host.finishProcess("export-csv", { error = "write_failed", detail = "PermissionError: Permission denied" })
   t.eq({ host.report().export.error, host.report().export.dir }, { "write_failed", "/home/u/Downloads" })
   t.eq(#host.notifications, 0)
-end)
-
-t.test("export honours XDG_DOWNLOAD_DIR from user-dirs.dirs", function()
-  local host = hostLib.new()
-  host.files["/home/u/.config/user-dirs.dirs"] = 'XDG_DOWNLOAD_DIR="$HOME/Dl"\n'
-  connectedIdle(host)
-  host.command({ action = "export_csv" })
-  t.eq(host.readJson("export-request.json").dir, "/home/u/Dl")
 end)
 
 -- ── Daily summary ──

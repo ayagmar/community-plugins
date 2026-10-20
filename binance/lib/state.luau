@@ -103,6 +103,11 @@ function M.alertUpdate(id: string, fields)
   send(command)
 end
 
+-- A holding's target share of the portfolio (0-1), or nil to remove it.
+function M.setAssetTarget(key: string, share: number?)
+  send({ action = "set_asset_target", key = key, share = share })
+end
+
 function M.alertRemove(id: string)
   send({ action = "alert_remove", id = id })
 end

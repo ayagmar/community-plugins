@@ -60,6 +60,7 @@ export type Input = {
   stocks: any, -- decoded stocks.json or nil
   prices: { [string]: any }, -- asset -> { price, open?, spark? }
   prevMarks: { [string]: number }, -- symbol -> last mark before today
+  costs: { [string]: any }?, -- crypto-costs.json assets: coin -> { avg_cost, cost, realized_pnl, cost_approx } in USD
   rate: number,
 }
 
@@ -97,6 +98,21 @@ function M.build(input: Input)
       end
       if p ~= nil and p.spark ~= nil then
         h.spark = p.spark
+      end
+    end
+    local c = input.costs and input.costs[asset]
+    if c ~= nil and tonumber(c.avg_cost) ~= nil then
+      -- The basis is per coin; the wallet's quantity is what is valued.
+      h.avgCost = (tonumber(c.avg_cost) :: number) / rate
+      h.cost = h.avgCost * q
+      if price ~= nil then
+        h.floating = pnl(h.value - h.cost, h.cost)
+      end
+      if c.cost_approx == true then
+        h.costApprox = true
+      end
+      if tonumber(c.realized_pnl) ~= nil then
+        h.realized = (tonumber(c.realized_pnl) :: number) / rate
       end
     end
     cryptoValue += h.value

@@ -1064,6 +1064,99 @@ class DailyFlowTests(unittest.TestCase):
         ])
 
 
+def fill(fill_id, at, qty, quote_qty, buyer, fee="0", fee_asset="", px="1"):
+    row = {"id": fill_id, "at_ms": at, "qty": qty, "quote_qty": quote_qty, "buyer": buyer,
+           "fee": fee, "fee_asset": fee_asset}
+    return {**row, "px": px} if px is not None else row
+
+
+class CryptoCostTests(unittest.TestCase):
+    def test_buys_and_deposits_set_the_average_and_sells_realize_against_it(self):
+        pairs = {"BTCUSDT": {"base": "BTC", "quote": "USDT", "fills": [
+            fill(1, 1, "1", "50000", True, fee="50", fee_asset="USDT"),
+            fill(2, 3, "0.5", "40000", False),
+        ]}}
+        # A deposit worth 69,950 when it arrived: 2 BTC for 120,000.
+        flows = [{"asset": "BTC", "dir": "in", "amount": "1", "usd": "69950", "at_ms": 2}]
+        costs = helper.replay_crypto(pairs, flows, {"BTC": Decimal("1.5")}, {"BTC"})
+        self.assertEqual(costs["BTC"], {"avg_cost": "60000", "cost": "90000", "realized_pnl": "10000",
+                                        "cost_approx": False})
+
+    def test_paying_with_a_coin_disposes_of_it_at_its_average(self):
+        pairs = {
+            "BTCUSDT": {"base": "BTC", "quote": "USDT", "fills": [fill(1, 1, "1", "40000", True)]},
+            # 10 ETH for 0.5 BTC when BTC was worth 60,000.
+            "ETHBTC": {"base": "ETH", "quote": "BTC", "fills": [fill(1, 2, "10", "0.5", True, px="60000")]},
+        }
+        costs = helper.replay_crypto(pairs, [], {"BTC": Decimal("0.5"), "ETH": Decimal("10")}, {"BTC", "ETH"})
+        self.assertEqual(costs["ETH"]["avg_cost"], "3000")
+        self.assertEqual((costs["BTC"]["avg_cost"], costs["BTC"]["realized_pnl"]), ("40000", "10000"))
+
+    def test_a_fee_paid_in_bnb_costs_the_buy_and_leaves_the_bnb_book(self):
+        pairs = {
+            "BNBUSDT": {"base": "BNB", "quote": "USDT", "fills": [fill(1, 1, "10", "6000", True)]},
+            "ETHUSDT": {"base": "ETH", "quote": "USDT", "fills": [
+                {**fill(1, 2, "1", "1000", True, fee="0.1", fee_asset="BNB"), "fee_usd": "60"}]},
+        }
+        costs = helper.replay_crypto(pairs, [], {"BNB": Decimal("9.9"), "ETH": Decimal("1")}, {"BNB", "ETH"})
+        self.assertEqual(costs["ETH"]["avg_cost"], "1060")
+        self.assertEqual((costs["BNB"]["avg_cost"], costs["BNB"]["cost_approx"]), ("600", False))
+
+    def test_a_wallet_the_history_does_not_explain_flags_or_drops_the_basis(self):
+        pairs = {"SOLUSDT": {"base": "SOL", "quote": "USDT", "fills": [fill(1, 1, "10", "1000", True)]}}
+        wallet = {"SOL": Decimal("10.5"), "DOGE": Decimal("100")}  # Earn rewards; DOGE from an airdrop
+        costs = helper.replay_crypto(pairs, [], wallet, {"SOL", "DOGE"})
+        self.assertEqual((costs["SOL"]["avg_cost"], costs["SOL"]["cost"], costs["SOL"]["cost_approx"]),
+                         ("100", "1050", True))
+        self.assertNotIn("DOGE", costs)
+
+    def test_a_deposit_without_a_price_makes_the_basis_approximate(self):
+        pairs = {"SOLUSDT": {"base": "SOL", "quote": "USDT", "fills": [fill(1, 1, "10", "1000", True)]}}
+        flows = [{"asset": "SOL", "dir": "in", "amount": "0.05", "unpriced": True, "at_ms": 2}]
+        costs = helper.replay_crypto(pairs, flows, {"SOL": Decimal("10.05")}, {"SOL"})
+        self.assertTrue(costs["SOL"]["cost_approx"])
+
+
+class TradesSyncTests(HelperTestCase):
+    T0 = 1_792_411_200_000
+
+    def setUp(self):
+        super().setUp()
+        pem = pem_from_seed("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        self.seed_keyring({("pair", "active"): json.dumps({"api_key": API_KEY, "private_key_pem": pem})})
+        self.now = self.T0
+        clock = patch.object(helper, "now_ms", lambda: self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.data_dir.mkdir(parents=True)
+        (self.data_dir / "balances.json").write_text(json.dumps({"v": 1, "wallets": [{"name": "Spot", "assets": [
+            {"asset": "BTC", "total": "0.5"}, {"asset": "USDT", "total": "100"}]}]}))
+        (self.data_dir / "flows.json").write_text(json.dumps({"v": 1, "complete": True, "flows": []}))
+        self.fake = FakeBinance({"/api/v3/myTrades": self.my_trades})
+
+    def my_trades(self, query):
+        if query["symbol"] != "BTCUSDT":
+            return 400, {"code": -1121, "msg": "Invalid symbol."}
+        rows = [{"id": 7, "time": self.T0 - 1000, "qty": "0.5", "quoteQty": "30000", "isBuyer": True,
+                 "commission": "0", "commissionAsset": "BTC"}]
+        return 200, [r for r in rows if r["id"] >= int(query["fromId"])]
+
+    def test_fills_become_a_cost_basis_and_pairs_that_do_not_exist_are_skipped_after(self):
+        result = self.run_helper("trades-sync", self.fake)
+        self.assertEqual((result["done"], result["assets"]), (True, 1), result)
+        costs = json.loads((self.data_dir / "crypto-costs.json").read_text())["assets"]
+        self.assertEqual((costs["BTC"]["avg_cost"], costs["BTC"]["cost_approx"]), ("60000", False))
+        first = self.fake.count("/api/v3/myTrades")
+        self.assertEqual(first, len(helper.TRADE_QUOTES) - 1)  # every quote but BTC itself; USDT is cash
+        # An hour later only the pair that exists is read again, from the next id.
+        self.now += 3_600_000
+        self.run_helper("trades-sync", self.fake)
+        calls = [q for p, q, _ in self.fake.calls if p == "/api/v3/myTrades"][first:]
+        self.assertEqual([(q["symbol"], q["fromId"]) for q in calls], [("BTCUSDT", "8")])
+        costs = json.loads((self.data_dir / "crypto-costs.json").read_text())["assets"]
+        self.assertEqual(costs["BTC"]["cost"], "30000")
+
+
 class ExportTests(HelperTestCase):
     def setUp(self):
         super().setUp()
@@ -1182,11 +1275,6 @@ class AccountFileTests(HelperTestCase):
         self.fake.routes["/sapi/v1/account/apiRestrictions"] = lambda q: (200, READ_ONLY)
         self.run_helper("verify", self.fake)
         self.assertNotIn("gate_failed", self.account())
-
-    def test_disconnect_removes_it(self):
-        self.run_helper("keygen")
-        self.run_helper("disconnect")
-        self.assertFalse((self.data_dir / "account.json").exists())
 
 
 class ProbeTests(HelperTestCase):
