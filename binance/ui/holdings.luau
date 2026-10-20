@@ -107,11 +107,12 @@ local function detailLine(h, report): string
     end
     return text
   end
-  local text = `{qty} {h.asset} · {fmt.money(h.price, currency)}`
+  -- With a cost basis the average takes the price's place: both don't fit
+  -- beside the sparkline, and the value on the right already prices it.
   if h.avgCost then
-    text ..= " · " .. tr(if h.costApprox then "panel.holdings.avg_approx" else "panel.holdings.avg", { price = fmt.money(h.avgCost, currency) })
+    return `{qty} {h.asset} · ` .. tr(if h.costApprox then "panel.holdings.avg_approx" else "panel.holdings.avg", { price = fmt.money(h.avgCost, currency) })
   end
-  return text
+  return `{qty} {h.asset} · {fmt.money(h.price, currency)}`
 end
 
 local function costTooltip(h, report): string?
